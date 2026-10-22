@@ -10,6 +10,9 @@ Embeds functions/methods using all 5 TLDR analysis layers:
 
 Uses BAAI/bge-large-en-v1.5 for embeddings (1024 dimensions)
 and FAISS for fast vector similarity search.
+
+Set TLDR_EMBEDDING_PROVIDER=openai to compute embeddings with the OpenAI
+embeddings API instead of a local model (see tldr/embeddings_openai.py).
 """
 
 import json
@@ -46,6 +49,10 @@ SUPPORTED_MODELS = {
 }
 
 DEFAULT_MODEL = "bge-large-en-v1.5"
+
+# Embedding providers: "local" (sentence-transformers) or "openai" (HTTP API)
+EMBEDDING_PROVIDERS = ("local", "openai")
+DEFAULT_PROVIDER = "local"
 
 # Project root markers - files that indicate a project root
 PROJECT_ROOT_MARKERS = [".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod", ".tldr"]
@@ -129,6 +136,24 @@ class EmbeddingUnit:
 
 
 MODEL_NAME = "BAAI/bge-large-en-v1.5"  # Legacy, use SUPPORTED_MODELS
+
+
+def resolve_provider(provider: Optional[str] = None) -> str:
+    """Return the embedding provider: argument, TLDR_EMBEDDING_PROVIDER, or default."""
+    value = (provider or os.environ.get("TLDR_EMBEDDING_PROVIDER") or DEFAULT_PROVIDER)
+    value = value.strip().lower()
+    if value not in EMBEDDING_PROVIDERS:
+        raise ValueError(
+            f"Unknown embedding provider {value!r}; expected one of: {', '.join(EMBEDDING_PROVIDERS)}"
+        )
+    return value
+
+
+def _canonical_model_name(model_name: str, provider: str) -> str:
+    """Map a model key to the name stored in index metadata."""
+    if provider == "local" and model_name in SUPPORTED_MODELS:
+        return SUPPORTED_MODELS[model_name]["hf_name"]
+    return model_name
 
 
 def _model_exists_locally(hf_name: str) -> bool:
@@ -936,6 +961,7 @@ def build_semantic_index(
     model: Optional[str] = None,
     show_progress: bool = True,
     respect_ignore: bool = True,
+    provider: Optional[str] = None,
 ) -> int:
     """Build and save FAISS index + metadata for a project.
 
@@ -949,6 +975,8 @@ def build_semantic_index(
         model: Model name from SUPPORTED_MODELS or HuggingFace name.
         show_progress: Show progress spinner (default: True).
         respect_ignore: If True, respect .tldrignore patterns (default True).
+        provider: "local" or "openai"; None uses TLDR_EMBEDDING_PROVIDER
+                  (default "local").
 
     Returns:
         Number of indexed units.
@@ -956,6 +984,13 @@ def build_semantic_index(
     import faiss
     import numpy as np
     from tldr.tldrignore import ensure_tldrignore
+
+    provider = resolve_provider(provider)
+    embedder = None
+    if provider == "openai":
+        # Create the client first so a missing key fails before extraction
+        from tldr.embeddings_openai import OpenAIEmbedder
+        embedder = OpenAIEmbedder(model=model)
 
     console = _get_progress_console() if show_progress else None
 
@@ -969,11 +1004,14 @@ def build_semantic_index(
         console.print(f"[yellow]{message}[/yellow]")
 
     # Resolve model name early to get HF name for metadata
-    model_key = model if model else DEFAULT_MODEL
-    if model_key in SUPPORTED_MODELS:
-        hf_name = SUPPORTED_MODELS[model_key]["hf_name"]
+    if embedder is not None:
+        hf_name = embedder.model
     else:
-        hf_name = model_key
+        model_key = model if model else DEFAULT_MODEL
+        if model_key in SUPPORTED_MODELS:
+            hf_name = SUPPORTED_MODELS[model_key]["hf_name"]
+        else:
+            hf_name = model_key
 
     # Always store cache at project root, not scan path
     cache_dir = project_root / ".tldr" / "cache" / "semantic"
@@ -1033,28 +1071,34 @@ def build_semantic_index(
         ) as progress:
             task = progress.add_task("Computing embeddings...", total=num_units)
 
-            model_obj = get_model(model)
+            model_obj = get_model(model) if embedder is None else None
+            chunk_size = BATCH_SIZE if embedder is None else embedder.batch_inputs
             all_embeddings = []
 
-            for i in range(0, num_units, BATCH_SIZE):
-                chunk_end = min(i + BATCH_SIZE, num_units)
+            for i in range(0, num_units, chunk_size):
+                chunk_end = min(i + chunk_size, num_units)
                 chunk_texts = texts[i:chunk_end]
 
                 current_unit = units[i]
                 short_path = current_unit.file if len(current_unit.file) < 40 else "..." + current_unit.file[-37:]
                 progress.update(task, description=f"[bold green]Embedding {short_path}::{current_unit.name}")
 
-                result = model_obj.encode(
-                    chunk_texts,
-                    batch_size=BATCH_SIZE,
-                    normalize_embeddings=True,
-                    show_progress_bar=False
-                )
+                if embedder is not None:
+                    result = embedder.embed(chunk_texts)
+                else:
+                    result = model_obj.encode(
+                        chunk_texts,
+                        batch_size=BATCH_SIZE,
+                        normalize_embeddings=True,
+                        show_progress_bar=False
+                    )
                 all_embeddings.extend(np.array(result, dtype=np.float32))
 
                 progress.update(task, completed=chunk_end)
 
             embeddings_matrix = np.vstack(all_embeddings)
+    elif embedder is not None:
+        embeddings_matrix = embedder.embed(texts)
     else:
         model_obj = get_model(model)
         result = model_obj.encode(
@@ -1063,6 +1107,13 @@ def build_semantic_index(
             normalize_embeddings=True
         )
         embeddings_matrix = np.array(result, dtype=np.float32)
+
+    if embedder is not None and show_progress:
+        print(
+            f"OpenAI embeddings: model {embedder.model}, {embedder.total_tokens} tokens, "
+            f"{embedder.requests} requests, {embedder.truncated} inputs truncated",
+            file=sys.stderr,
+        )
 
     dimension = embeddings_matrix.shape[1]
     index = faiss.IndexFlatIP(dimension)
@@ -1075,6 +1126,7 @@ def build_semantic_index(
     # Save metadata with actual model used
     metadata = {
         "units": [u.to_dict() for u in units],
+        "provider": provider,
         "model": hf_name,
         "dimension": dimension,
         "count": len(units),
@@ -1136,14 +1188,50 @@ def semantic_search(
     units = metadata["units"]
 
     # Use model from metadata if not specified (ensures matching embeddings)
+    index_provider = metadata.get("provider", DEFAULT_PROVIDER)
     index_model = metadata.get("model")
+    index_dimension = metadata.get("dimension", index.d)
+    built_with = f"provider '{index_provider}', model '{index_model}', dimension {index_dimension}"
+
+    env_provider = os.environ.get("TLDR_EMBEDDING_PROVIDER")
+    if env_provider and resolve_provider(env_provider) != index_provider:
+        raise ValueError(
+            f"Semantic index at {cache_dir} was built with {built_with}, but "
+            f"TLDR_EMBEDDING_PROVIDER={env_provider}. Rebuild it with 'tldr semantic index' "
+            f"or unset TLDR_EMBEDDING_PROVIDER."
+        )
+    if index_provider == "openai" and model is None:
+        model = os.environ.get("TLDR_OPENAI_EMBEDDING_MODEL") or None
+    if model is not None and index_model and _canonical_model_name(model, index_provider) != index_model:
+        raise ValueError(
+            f"Semantic index at {cache_dir} was built with {built_with}; "
+            f"cannot search it with model '{model}'. Rebuild the index with this model."
+        )
     if model is None and index_model:
         model = index_model
 
-    # Embed query (with instruction prefix for BGE)
-    query_text = f"Represent this code search query: {query}"
-    query_embedding = compute_embedding(query_text, model_name=model)
+    if index_provider == "openai":
+        from tldr.embeddings_openai import OpenAIEmbedder, OPENAI_MODEL_DIMENSIONS, resolve_dimensions
+        dimensions = resolve_dimensions()
+        if dimensions is not None and dimensions != index_dimension:
+            raise ValueError(
+                f"Semantic index at {cache_dir} was built with {built_with}; "
+                f"TLDR_OPENAI_EMBEDDING_DIMENSIONS={dimensions} does not match."
+            )
+        if OPENAI_MODEL_DIMENSIONS.get(model) != index_dimension:
+            dimensions = index_dimension
+        query_embedding = OpenAIEmbedder(model=model, dimensions=dimensions).embed([query])
+    else:
+        # Embed query (with instruction prefix for BGE)
+        query_text = f"Represent this code search query: {query}"
+        query_embedding = compute_embedding(query_text, model_name=model)
     query_embedding = query_embedding.reshape(1, -1)
+
+    if query_embedding.shape[1] != index.d:
+        raise ValueError(
+            f"Semantic index at {cache_dir} was built with {built_with}; the query "
+            f"embedding has dimension {query_embedding.shape[1]}. Rebuild the index."
+        )
 
     # Search
     k = min(k, len(units))

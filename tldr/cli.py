@@ -383,7 +383,15 @@ Semantic Search:
     index_p.add_argument(
         "--model",
         default=None,
-        help="Embedding model: bge-large-en-v1.5 (1.3GB, default) or all-MiniLM-L6-v2 (80MB)",
+        help="Embedding model: bge-large-en-v1.5 (1.3GB, default) or all-MiniLM-L6-v2 (80MB); "
+        "with --provider openai: an OpenAI model (default text-embedding-3-small)",
+    )
+    index_p.add_argument(
+        "--provider",
+        default=None,
+        choices=["local", "openai"],
+        help="Embedding provider (default: $TLDR_EMBEDDING_PROVIDER or local). "
+        "openai sends code to the OpenAI API",
     )
 
     # tldr semantic search <query>
@@ -969,7 +977,7 @@ Semantic Search:
 
             if args.action == "index":
                 respect_ignore = not getattr(args, 'no_ignore', False)
-                count = build_semantic_index(args.path, lang=args.lang, model=args.model, respect_ignore=respect_ignore)
+                count = build_semantic_index(args.path, lang=args.lang, model=args.model, respect_ignore=respect_ignore, provider=args.provider)
                 print(f"Indexed {count} code units")
 
             elif args.action == "search":
