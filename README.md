@@ -107,6 +107,35 @@ tldr semantic "database connection pooling" .
 
 Embedding dependencies (`sentence-transformers`, `faiss-cpu`) are included with `pip install llm-tldr`. The index is cached in `.tldr/cache/semantic.faiss`.
 
+### Using OpenAI Embeddings (Optional)
+
+Instead of the local model, embeddings can be computed with the [OpenAI embeddings API](https://platform.openai.com/docs/guides/embeddings). The OpenAI backend talks to the API with `requests`; it needs `faiss-cpu` and `numpy`, but never imports `torch`, `transformers` or `sentence-transformers`, so it also works in an environment where those are not installed.
+
+> **Privacy note:** with this backend, the text of every indexed code unit (signature, docstring, call graph and flow summaries, the first lines of the body) and every search query is sent to OpenAI. Only enable it for code you are allowed to share with OpenAI.
+
+```bash
+export TLDR_EMBEDDING_PROVIDER=openai
+export TLDR_OPENAI_API_KEY_FILE=/path/to/openai-api-key   # or: export OPENAI_API_KEY=...
+
+tldr semantic index . --lang all        # or: tldr semantic index . --provider openai
+tldr semantic search "database connection pooling" --path .
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TLDR_EMBEDDING_PROVIDER` | `local` | `local` (sentence-transformers) or `openai` |
+| `OPENAI_API_KEY` | — | API key |
+| `TLDR_OPENAI_API_KEY_FILE` | — | Path to a file containing the API key (takes precedence over `OPENAI_API_KEY`; keep it `chmod 600`) |
+| `TLDR_OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model, e.g. `text-embedding-3-large` |
+| `TLDR_OPENAI_EMBEDDING_DIMENSIONS` | model default | Shorter vectors (`text-embedding-3-*` only) |
+
+Notes:
+
+- The index records the provider, model and dimension. Searching it with a different provider, model or dimension fails with an error that asks you to rebuild the index.
+- Requests are batched; rate limits (HTTP 429) and server errors are retried with backoff. Inputs longer than the model limit are truncated.
+- The API key is read from the environment or the key file only; it is not written to the index and not included in error messages.
+- Each `tldr semantic index` run re-embeds the whole project and is billed by OpenAI (`text-embedding-3-small` is priced per million tokens; the token count is printed after indexing). The daemon's automatic re-index does the same, so with this backend consider raising `auto_reindex_threshold` or setting `"enabled": false` in `.tldr/config.json` (see [Settings](#settings---daemon-behavior)).
+
 ### Keeping the Index Fresh
 
 The daemon tracks dirty files and auto-rebuilds after 20 changes, but you need to notify it when files change:
